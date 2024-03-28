@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
+import argparse
 import collections
 import csv
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import logging
 import pprint
@@ -16,9 +17,34 @@ import gnucash # type: ignore
 
 LOGGER = logging.getLogger(__name__)
 
+def parse_args():
+    """Parse arguments"""
+    parser = argparse.ArgumentParser(description="Load Amazon transactions into GnuCash")
+    # https://www.amazon.com/hz/privacy-central/data-requests/preview.html
+    # It can take a few days to generate, so don't wait until you really
+    # need to do this import.
+    parser.add_argument('--amazon-orders', type=argparse.FileType('r'),
+                        help="Retail.OrderHistory file", )
+    # Make sure to include table header
+    parser.add_argument('--amazon-balance', type=argparse.FileType('r'),
+                        help="Gift card balance (as TSV) copy/pasted from "
+                             "https://www.amazon.com/gc/balance")
+    parser.add_argument('--gnucash', type=str,
+                        help='path to gnucash file')
+    return parser.parse_args()
+
+
 def comma_decimal(string):
     """Given an amount as a string using commas as thousands separators, return a Decimal"""
     return Decimal(string.replace(',', ''))
+
+@dataclass
+class BalanceActivity:
+    date: date
+    desc: str
+    event: str  # enum would be better
+    arg: str
+    amount: Decimal
 
 @dataclass
 class LineItem:
@@ -72,7 +98,37 @@ class Order:
         if len(self.payments) > 2:
             LOGGER.warning("Many payments: %s %s", self.payments, self)
 
-def load_csv(fp) -> Dict[str,Order]:
+AMAZON_BALANCE_PAYMENT  = re.compile(r"Payment towards Amazon.com order \(‎?(?P<num>[0-9-]*)\)")
+AMAZON_BALANCE_GC_CLAIM = re.compile(r"Gift card claim \(claim code xxxx-xxxxxx-(?P<code>[A-Z0-9]{4})\)")
+AMAZON_BALANCE_RELOAD   = re.compile(r"Balance Reload \(‎?(?P<num>[0-9-]*)\)")
+
+
+def load_amazon_balance(fp) -> List[BalanceActivity]:
+    reader = csv.DictReader(fp, dialect=csv.excel_tab)
+    activity: List[BalanceActivity] = []
+    for line in reader:
+        event = None
+        desc = line['Description '].strip()
+        match = AMAZON_BALANCE_PAYMENT.match(desc)
+        if match:
+            event = 'payment'
+            arg = match.group('num')
+        match = AMAZON_BALANCE_GC_CLAIM.match(desc)
+        if match:
+            event = 'gc-claim'
+            arg = match.group('code')
+        match = AMAZON_BALANCE_RELOAD.match(desc)
+        if match:
+            event = 'reload'
+            arg = match.group('num')
+        assert event, 'unknown balance activity: %s' % (desc, )
+        event_date = datetime.strptime(line['Date '].strip(), '%B %d, %Y').date()
+        amount = comma_decimal(line['Amount'].replace('$', ''))
+        activity.append(BalanceActivity(event_date, desc, event, arg, amount))
+    return activity
+
+
+def load_amazon_orders(fp, balance_activity) -> Dict[str,Order]:
     reader = csv.DictReader(fp)
     orders: Dict[str,Order] = {}
     for line in reader:
@@ -192,8 +248,17 @@ def gnucash_import(filename, orders):
         imbalance = root.lookup_by_full_name('Imbalance-USD')
         match_splits(imbalance, accts, orders)
 
-if __name__ == '__main__':
+def main():
+    args = parse_args()
     logging.basicConfig(level=logging.DEBUG)
-    orders = load_csv(sys.stdin)
+    if args.amazon_balance:
+        balance_activity = load_amazon_balance(args.amazon_balance)
+    else:
+        balance_activity = []
+    print(pprint.pformat(balance_activity, width=120))
+    orders = load_amazon_orders(args.amazon_orders, balance_activity)
     print(pprint.pformat(orders, width=120))
-    gnucash_import(sys.argv[1], orders)
+    gnucash_import(args.gnucash, orders)
+
+if __name__ == '__main__':
+    main()
