@@ -11,7 +11,7 @@ import pprint
 import re
 import sys
 
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Tuple
 
 import gnucash # type: ignore
 
@@ -84,28 +84,48 @@ class LineItem:
 
 @dataclass
 class Order:
+    order_id: str
     items: list[LineItem]
     payments: list
     total: Decimal
 
-    def update_payment(self):
+    def update_payment(self, balance_payments):
         self.total = sum(item.cost for item in self.items)
         self.date = min(item.date for item in self.items)
         item = self.items[0]
         payment = item.data['Payment Instrument Type']
         payments = payment.split(' and ')
-        self.payments = [(instrument, Decimal(self.total if i == 0 else 0)) for i, instrument in enumerate(payments)]
-        if len(self.payments) > 2:
-            LOGGER.warning("Many payments: %s %s", self.payments, self)
+        assert len(payments) <= 2
+
+        # Find gift card payments, and allocate payments between credit card
+        # and gift card balances as we can
+        balance_payment = balance_payments.get(self.order_id)
+        if balance_payment:
+            assert 'Gift Certificate/Card' in payments
+            gift_amount = balance_payment.amount * -1
+        else:
+            gift_amount = 0
+        balance = self.total
+        self.payments = []
+        key = lambda x: (((x == 'Gift Certificate/Card') ^ (gift_amount > 0)), x)
+        for instrument in sorted(payments, key=key):
+            if 'Gift Certificate/Card' == instrument and gift_amount > 0:
+                amount = gift_amount
+            else:
+                amount = balance
+            self.payments.append((instrument, amount))
+            balance -= amount
+        assert balance == 0, "payments=%s balance_payment=%s" % (self.payments, balance_payment)
 
 AMAZON_BALANCE_PAYMENT  = re.compile(r"Payment towards Amazon.com order \(‎?(?P<num>[0-9-]*)\)")
 AMAZON_BALANCE_GC_CLAIM = re.compile(r"Gift card claim \(claim code xxxx-xxxxxx-(?P<code>[A-Z0-9]{4})\)")
 AMAZON_BALANCE_RELOAD   = re.compile(r"Balance Reload \(‎?(?P<num>[0-9-]*)\)")
 
 
-def load_amazon_balance(fp) -> List[BalanceActivity]:
+def load_amazon_balance(fp) -> Tuple[List[BalanceActivity], Dict[str,BalanceActivity]]:
     reader = csv.DictReader(fp, dialect=csv.excel_tab)
-    activity: List[BalanceActivity] = []
+    activities: List[BalanceActivity] = []
+    payments: Dict[str,BalanceActivity] = {}
     for line in reader:
         event = None
         desc = line['Description '].strip()
@@ -124,8 +144,11 @@ def load_amazon_balance(fp) -> List[BalanceActivity]:
         assert event, 'unknown balance activity: %s' % (desc, )
         event_date = datetime.strptime(line['Date '].strip(), '%B %d, %Y').date()
         amount = comma_decimal(line['Amount'].replace('$', ''))
-        activity.append(BalanceActivity(event_date, desc, event, arg, amount))
-    return activity
+        activity = BalanceActivity(event_date, desc, event, arg, amount)
+        activities.append(activity)
+        if event == 'payment':
+            payments[arg] = activity
+    return activities, payments
 
 
 def load_amazon_orders(fp, balance_activity) -> Dict[str,Order]:
@@ -141,13 +164,13 @@ def load_amazon_orders(fp, balance_activity) -> Dict[str,Order]:
         order_id = line['Order ID']
         order = orders.get(order_id)
         if not order:
-            order = Order([], [], Decimal(0))
+            order = Order(order_id, [], [], Decimal(0))
             orders[order_id] = order
         order.items.append(LineItem.from_amazon_csv(line))
-    payment_count = collections.Counter()
-    payment_instruments = collections.Counter()
+    payment_count: collections.Counter[int] = collections.Counter()
+    payment_instruments: collections.Counter[str] = collections.Counter()
     for order_id, order in orders.items():
-        order.update_payment()
+        order.update_payment(balance_activity)
         payment_count[len(order.payments)] += 1
         for payment, amount in order.payments:
             payment_instruments[payment] += 1
@@ -252,11 +275,12 @@ def main():
     args = parse_args()
     logging.basicConfig(level=logging.DEBUG)
     if args.amazon_balance:
-        balance_activity = load_amazon_balance(args.amazon_balance)
+        balance_activities, balance_payments = load_amazon_balance(args.amazon_balance)
     else:
-        balance_activity = []
-    print(pprint.pformat(balance_activity, width=120))
-    orders = load_amazon_orders(args.amazon_orders, balance_activity)
+        balance_activities = []
+        balance_payments = {}
+    print(pprint.pformat(balance_activities, width=120))
+    orders = load_amazon_orders(args.amazon_orders, balance_payments)
     print(pprint.pformat(orders, width=120))
     gnucash_import(args.gnucash, orders)
 
