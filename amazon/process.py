@@ -228,16 +228,22 @@ def gnc_to_decimal(amt):
 def set_split_amount(split, amt):
     num, denom = Decimal(amt).as_integer_ratio()
     gnc = gnucash.GncNumeric(num, denom)
-    split.SetAmount(gnc)
+    split.SetValue(gnc)
     LOGGER.info('amt=%s gnc=%s split=%s memo=%s', amt, gnc_to_decimal(gnc),
-                gnc_to_decimal(split.GetAmount()), split.GetMemo())
+                gnc_to_decimal(split.GetValue()), split.GetMemo())
     LOGGER.info("set split: %s", split_tuple(split))
 
 def split_tuple(split):
     """Helper function to convert a split into a printable tuple"""
-    splits = [(split1.GetAccount().get_full_name(), split1.GetAmount().to_double())
+    splits = [(id(split1), split1.GetAccount().get_full_name(), split1.GetValue().to_double())
               for split1 in split.parent.GetSplitList()]
     return split.parent.GetDate(), len(split.parent.GetSplitList()), splits
+
+def trans_tuple(trans):
+    """Helper function to convert a split into a printable tuple"""
+    splits = [(id(split1), split1.GetAccount().get_full_name(), split1.GetValue().to_double())
+              for split1 in trans.GetSplitList()]
+    return trans.GetDate(), len(trans.GetSplitList()), splits
 
 def match_account(instrument, accts):
     """Match account based on payment instrument from import to candidate accounts"""
@@ -269,7 +275,7 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         candidates = acct_trans[other_acct_name]
         matched = []
         for match_split in candidates:
-            match_amount = -1 * gnc_to_decimal(match_split.GetAmount())
+            match_amount = -1 * gnc_to_decimal(match_split.GetValue())
             if (amount == match_amount and
                 near_date(order.date, match_split.parent.GetDate())):
                 # Splits match!
@@ -297,14 +303,18 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
     remove_splits = []
     if payment_split:
         LOGGER.info("pre-update transaction: %s", split_tuple(payment_split))
+        LOGGER.info("pre-update transaction: %s", split_tuple(payment_split))
         # There's an existing split for payment
         transaction = payment_split.parent
-        transaction.BeginEdit()
+        LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
+        LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
+        #transaction.BeginEdit()
         for split in transaction.GetSplitList():
-            LOGGER.info("iterating %s %s", split.GetAccount(), imbalance)
+            LOGGER.info("iterating %s %s", split.GetAccount().get_full_name(), imbalance.get_full_name())
             if split.GetAccount().get_full_name() == imbalance.get_full_name():
                 remove_splits.append(split)
-                LOGGER.info('destroy')
+                LOGGER.info('destroy %d', id(split))
+                #split.Destroy()
                 #payment_split.RemovePeerSplit(split)
                 #split.SetParent(None)
     else:
@@ -320,7 +330,7 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         # ignore.
         return
 
-    LOGGER.info("pre-update transaction: %s", split_tuple(payment_split))
+    LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
 
     # Add a tag split to mark the import
     split = gnucash.Split(book)
@@ -341,6 +351,8 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         split.SetAccount(other_acct)
         set_split_amount(split, -1*amount)
 
+    LOGGER.info("payment splits: %s", trans_tuple(transaction))
+
     # Add purchase splits
     for item in order.items:
         split = gnucash.Split(book)
@@ -349,17 +361,17 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         split.SetAccount(gift_acct if item.is_gift else expense_acct)
         set_split_amount(split, item.cost)
 
-    LOGGER.info("updated transaction: %s", split_tuple(payment_split))
+    LOGGER.info("purchase splits: %s", trans_tuple(transaction))
 
     for split in remove_splits:
-        LOGGER.info("remove split: %s %s", split, split_tuple(payment_split))
+        LOGGER.info("remove split: %d %s", id(split), trans_tuple(transaction))
         #payment_split.RemovePeerSplit(split)
-        split.SetParent(None)
-        #split.Destroy()
-    LOGGER.info("updated transaction: %s", split_tuple(payment_split))
+        #split.SetParent(None)
+        split.Destroy()
+    LOGGER.info("updated transaction: %s", trans_tuple(transaction))
 
     assert transaction.IsBalanced()
-    transaction.CommitEdit()
+    #transaction.CommitEdit()
 
 def match_splits(imbalance, tag_acct, gift_acct, expense_acct, cc_accts, orders):
     """Match Amazon orders with GnuCash splits"""
