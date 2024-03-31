@@ -4,14 +4,14 @@
 import argparse
 import collections
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime
 from decimal import Decimal
 import logging
 import pprint
 import re
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import gnucash # type: ignore
 
@@ -66,6 +66,7 @@ class LineItem:
 
     @classmethod
     def from_amazon_csv(cls, item):
+        """Create line item from (dict of an) Amazon CSV file"""
         # Money related columns for Amazon:
         # Total Owed appears to be the total of all the per-line item costs
         # So (Unit Price + Unit Price Tax)*Quantity + Shipping Charge + Total Discounts
@@ -96,11 +97,18 @@ class LineItem:
 class Order:
     """Amazon order"""
     order_id: str
-    items: list[LineItem]
-    payments: list
-    total: Decimal
+    items: list[LineItem] = field(default_factory=list)
+    payments: list = field(default_factory=list)
+    total: Decimal = Decimal(0)
+    date: Optional[datetime.datetime] = None
 
     def update_payment(self, balance_payments):
+        """Update fields of Order based on the LineItems
+
+        - Compute the total
+        - Compute the date (first shipping date)
+        - Allocate payments between credit card and gift card
+        """
         self.total = sum(item.cost for item in self.items)
         self.date = min(item.date for item in self.items)
         item = self.items[0]
@@ -126,15 +134,16 @@ class Order:
                 amount = balance
             self.payments.append((instrument, amount))
             balance -= amount
-        assert balance == 0, "payments=%s balance_payment=%s" % (self.payments, balance_payment)
+        assert balance == 0, f"{self.payments=} {balance_payment=}"
 
 AMAZON_BALANCE_PAYMENT  = re.compile(r"Payment towards Amazon.com order \(‎?(?P<num>[0-9-]*)\)")
 AMAZON_BALANCE_GC_CLAIM = re.compile(r"Gift card claim \(claim code xxxx-xxxxxx-(?P<code>[A-Z0-9]{4})\)") # pylint:disable=line-too-long
 AMAZON_BALANCE_RELOAD   = re.compile(r"Balance Reload \(‎?(?P<num>[0-9-]*)\)")
 
 
-def load_amazon_balance(fp) -> BalanceActivities:
-    reader = csv.DictReader(fp, dialect=csv.excel_tab)
+def load_amazon_balance(bal_fp) -> BalanceActivities:
+    """Return Amazon gift card balances by parsing CSV file"""
+    reader = csv.DictReader(bal_fp, dialect=csv.excel_tab)
     activities: List[BalanceActivity] = []
     payments: Dict[str,BalanceActivity] = {}
     reload: Dict[str,BalanceActivity] = {}
@@ -153,7 +162,7 @@ def load_amazon_balance(fp) -> BalanceActivities:
         if match:
             event = 'reload'
             arg = match.group('num')
-        assert event, 'unknown balance activity: %s' % (desc, )
+        assert event, f'unknown balance activity: {desc}'
         event_date = datetime.datetime.strptime(line['Date '].strip(), '%B %d, %Y').date()
         amount = comma_decimal(line['Amount'].replace('$', ''))
         activity = BalanceActivity(event_date, desc, event, arg, amount)
@@ -165,8 +174,15 @@ def load_amazon_balance(fp) -> BalanceActivities:
     return BalanceActivities(activities, payments, reload)
 
 
-def load_amazon_orders(fp, balance_payments) -> Dict[str,Order]:
-    reader = csv.DictReader(fp)
+def load_amazon_orders(order_fp, balance_payments) -> Dict[str,Order]:
+    """Return Amazon orders by parsing CSV file
+
+    The CSV file can be requested from:
+    https://www.amazon.com/hz/privacy-central/data-requests/preview.html
+    It can take a few days to generate, so don't wait until you really
+    need to do this import.
+    """
+    reader = csv.DictReader(order_fp)
     orders: Dict[str,Order] = {}
     for line in reader:
         if line['Order Status'] == 'Cancelled':
@@ -178,7 +194,7 @@ def load_amazon_orders(fp, balance_payments) -> Dict[str,Order]:
         order_id = line['Order ID']
         order = orders.get(order_id)
         if not order:
-            order = Order(order_id, [], [], Decimal(0))
+            order = Order(order_id)
             orders[order_id] = order
         order.items.append(LineItem.from_amazon_csv(line))
     payment_count: collections.Counter[int] = collections.Counter()
@@ -204,14 +220,19 @@ ACCT_NUM_REGEX = re.compile(r'(?P<num>\d{4})\D')
 #    acct: gnucash.Account
 #    trans: List[gnucash.Transaction]
 
+IGNORED_CREDITCARD_ACCOUNTS = [
+    '1008',     # Two AmEx accounts, fortunately little-used
+]
+
 def get_creditcard_accounts(root: gnucash.Account) -> Dict[str,gnucash.Account]:
+    """Build a dict of last-4-digits to GnuCash Account objects"""
     accts = root.lookup_by_full_name('Credit Cards').get_descendants()
     acct_map = {}
     for acct in accts:
         match = ACCT_NUM_REGEX.search(acct.GetName())
         if match:
             num = match.group('num')
-            if num == '1008': # Two AmEx accounts, fortunately little-used
+            if num in IGNORED_CREDITCARD_ACCOUNTS:
                 LOGGER.debug("Ignoring known-dup account number: %s", acct.GetName())
                 continue
             assert num not in acct_map
@@ -222,10 +243,14 @@ def get_creditcard_accounts(root: gnucash.Account) -> Dict[str,gnucash.Account]:
     acct_map['Gift Certificate/Card'] = root.lookup_by_full_name(gift_name)
     return acct_map
 
-def gnc_to_decimal(amt):
+def gnc_to_decimal(amt: gnucash.GncNumeric) -> Decimal:
+    """Convert GncNumeric to a Decimal"""
     return Decimal(amt.num()) / amt.denom()
 
 def set_split_amount(split, amt):
+    """Set the amount/value of a GnuCash split
+
+    Converts from a Python number to GncNumeric."""
     num, denom = Decimal(amt).as_integer_ratio()
     gnc = gnucash.GncNumeric(num, denom)
     split.SetValue(gnc)
@@ -258,17 +283,25 @@ def near_date(order_date, cc_date):
     return ((order_date - datetime.timedelta(days=2) <= cc_date) and
             (order_date + datetime.timedelta(days=14) > cc_date))
 
+DEBUG_ORDER_ID: List[str] = []
+
 def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, expense_acct, ):
     """Match a single Amazon order with GnuCash splits"""
+    # Pylint isn't wrong that this function is too big, but fixing that is
+    # bigger refactoring project.
+    # pylint:disable=too-many-arguments,too-many-locals,too-many-branches,too-many-statements
     book = imbalance.get_book()
     payment_splits = []
     payment_split = None
+
+    if order.order_id in DEBUG_ORDER_ID:
+        LOGGER.info('order=%s', order)
 
     # Find candidate payments
     for instrument, amount in order.payments:
         other_acct = match_account(instrument, cc_accts)
         if not other_acct:
-            LOGGER.warning('unknown account %s on %s', instrument, order.date)
+            LOGGER.warning('unknown account %s on %s %s', instrument, order.date, order.order_id)
             payment_splits.append(None)
             continue # next payment
         other_acct_name = other_acct.get_full_name()
@@ -276,6 +309,9 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         matched = []
         for match_split in candidates:
             match_amount = -1 * gnc_to_decimal(match_split.GetValue())
+            if order.order_id in DEBUG_ORDER_ID:
+                LOGGER.info('comparing %s?=%s to %s', amount, match_amount,
+                            split_tuple(match_split))
             if (amount == match_amount and
                 near_date(order.date, match_split.parent.GetDate())):
                 # Splits match!
@@ -302,35 +338,19 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
 
     remove_splits = []
     if payment_split:
-        LOGGER.info("pre-update transaction: %s", split_tuple(payment_split))
-        LOGGER.info("pre-update transaction: %s", split_tuple(payment_split))
         # There's an existing split for payment
         transaction = payment_split.parent
         LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
-        LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
-        #transaction.BeginEdit()
         for split in transaction.GetSplitList():
-            LOGGER.info("iterating %s %s", split.GetAccount().get_full_name(), imbalance.get_full_name())
             if split.GetAccount().get_full_name() == imbalance.get_full_name():
                 remove_splits.append(split)
-                LOGGER.info('destroy %d', id(split))
-                #split.Destroy()
-                #payment_split.RemovePeerSplit(split)
-                #split.SetParent(None)
     else:
-        # Completely new transaction
-        #transaction = gnucash.Transaction(book)
-        #transaction.SetDate(order.date)
-        #transaction.SetDescription("Amazon purchase")
-
         # Either this order has not yet been imported, it's gift-card only so
         # doesn't show up in CC imports, or it's been imported and already
         # moved away. In the first case we want to wait, the second basically
         # doesn't exist, and the third we don't want to act again. Either way,
         # ignore.
         return
-
-    LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
 
     # Add a tag split to mark the import
     split = gnucash.Split(book)
@@ -351,8 +371,6 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         split.SetAccount(other_acct)
         set_split_amount(split, -1*amount)
 
-    LOGGER.info("payment splits: %s", trans_tuple(transaction))
-
     # Add purchase splits
     for item in order.items:
         split = gnucash.Split(book)
@@ -361,26 +379,21 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         split.SetAccount(gift_acct if item.is_gift else expense_acct)
         set_split_amount(split, item.cost)
 
-    LOGGER.info("purchase splits: %s", trans_tuple(transaction))
-
     for split in remove_splits:
-        LOGGER.info("remove split: %d %s", id(split), trans_tuple(transaction))
-        #payment_split.RemovePeerSplit(split)
-        #split.SetParent(None)
         split.Destroy()
     LOGGER.info("updated transaction: %s", trans_tuple(transaction))
-
     assert transaction.IsBalanced()
-    #transaction.CommitEdit()
 
 def match_splits(imbalance, tag_acct, gift_acct, expense_acct, cc_accts, orders):
     """Match Amazon orders with GnuCash splits"""
+    # Pylint isn't wrong about this, but we'll fix it when refactoring match_order
+    # pylint:disable=too-many-arguments
     splits = imbalance.GetSplitList()
 
     # Build a map of CC account to CC splits that need to be matched
     acct_trans = {cc_acct.get_full_name(): [] for cc_acct in cc_accts.values()}
     for split in splits:
-        LOGGER.info(split_tuple(split))
+        LOGGER.info("trying to match imbalance: %s", split_tuple(split))
         for other_split in split.parent.GetSplitList():
             acct_trans.get(other_split.GetAccount().get_full_name(), []).append(other_split)
 
@@ -389,6 +402,10 @@ def match_splits(imbalance, tag_acct, gift_acct, expense_acct, cc_accts, orders)
 
 
 def gnucash_import(filename, orders):
+    """Handle all the GnuCash needing bits of this process
+
+    (Open the file, find credit card accounts, match up orders)
+    """
     book_uri = 'file://' + filename
     mode = gnucash.SessionOpenMode.SESSION_READ_ONLY
     mode = gnucash.SessionOpenMode.SESSION_NORMAL_OPEN
@@ -403,8 +420,9 @@ def gnucash_import(filename, orders):
         match_splits(imbalance, tag_acct, gift_acct, expense_acct, accts, orders)
 
 def main():
+    """Do everything"""
     args = parse_args()
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     if args.amazon_balance:
         balance_activities = load_amazon_balance(args.amazon_balance)
     else:
