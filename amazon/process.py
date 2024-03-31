@@ -283,21 +283,31 @@ def near_date(order_date, cc_date):
     return ((order_date - datetime.timedelta(days=2) <= cc_date) and
             (order_date + datetime.timedelta(days=14) > cc_date))
 
+@dataclass
+class AccountMap:
+    """Significant accounts for import
+
+    cc: mapping of credit card numbers to accounts
+    source: source of splits to replace (generally Imbalance-USD)
+    tag: special account to for tagging that these were auto-imported
+    gift: account to assign gift line items to
+    expense: default account to assign line items to
+    """
+    cc: Dict[str,gnucash.Account] # pylint:disable=invalid-name
+    source: gnucash.Account
+    tag: gnucash.Account
+    gift: gnucash.Account
+    expense: gnucash.Account
+
+
 DEBUG_ORDER_ID: List[str] = []
 
-def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, expense_acct, ):
-    """Match a single Amazon order with GnuCash splits"""
-    # Pylint isn't wrong that this function is too big, but fixing that is
-    # bigger refactoring project.
-    # pylint:disable=too-many-arguments,too-many-locals,too-many-branches,too-many-statements
-    book = imbalance.get_book()
-    payment_splits = []
+def match_order__find_payments(order, cc_accts, acct_trans):
+    """match_order: Find candidate payments"""
+    payment_splits: List[gnucash.Split] = []
     payment_split = None
-
     if order.order_id in DEBUG_ORDER_ID:
         LOGGER.info('order=%s', order)
-
-    # Find candidate payments
     for instrument, amount in order.payments:
         other_acct = match_account(instrument, cc_accts)
         if not other_acct:
@@ -336,13 +346,18 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
                (f'multiple payments: {order.payments=}, {split=}, '
                 f'{payment_splits=}, {payment_split=}')
 
+    return payment_split, payment_splits
+
+
+def match_order__update_splits(order, payment_split, payment_splits, acct_map):
+    """Update GnuCash splits for matched order"""
     remove_splits = []
     if payment_split:
         # There's an existing split for payment
         transaction = payment_split.parent
         LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
         for split in transaction.GetSplitList():
-            if split.GetAccount().get_full_name() == imbalance.get_full_name():
+            if split.GetAccount().get_full_name() == acct_map.source.get_full_name():
                 remove_splits.append(split)
     else:
         # Either this order has not yet been imported, it's gift-card only so
@@ -352,11 +367,12 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         # ignore.
         return
 
+    book = acct_map.source.get_book()
     # Add a tag split to mark the import
     split = gnucash.Split(book)
     split.SetParent(transaction)
     split.SetMemo(f'auto-imported Amazon purchase {order.order_id}')
-    split.SetAccount(tag_acct)
+    split.SetAccount(acct_map.tag)
     set_split_amount(split, 0)
 
     # Add payment splits
@@ -364,7 +380,7 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         if split == payment_split:
             # Already set up
             continue
-        other_acct = match_account(instrument, cc_accts)
+        other_acct = match_account(instrument, acct_map.cc)
         split = gnucash.Split(book)
         split.SetParent(transaction)
         split.SetMemo('payment')
@@ -376,7 +392,7 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
         split = gnucash.Split(book)
         split.SetParent(transaction)
         split.SetMemo(item.desc)
-        split.SetAccount(gift_acct if item.is_gift else expense_acct)
+        split.SetAccount(acct_map.gift if item.is_gift else acct_map.expense)
         set_split_amount(split, item.cost)
 
     for split in remove_splits:
@@ -384,21 +400,27 @@ def match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, exp
     LOGGER.info("updated transaction: %s", trans_tuple(transaction))
     assert transaction.IsBalanced()
 
-def match_splits(imbalance, tag_acct, gift_acct, expense_acct, cc_accts, orders):
+
+def match_order(order, acct_map: AccountMap, acct_trans, ):
+    """Match a single Amazon order with GnuCash splits"""
+    payment_split, payment_splits = match_order__find_payments(order, acct_map.cc, acct_trans)
+    match_order__update_splits(order, payment_split, payment_splits, acct_map)
+
+
+def match_splits(acct_map, orders):
     """Match Amazon orders with GnuCash splits"""
     # Pylint isn't wrong about this, but we'll fix it when refactoring match_order
-    # pylint:disable=too-many-arguments
-    splits = imbalance.GetSplitList()
+    splits = acct_map.source.GetSplitList()
 
     # Build a map of CC account to CC splits that need to be matched
-    acct_trans = {cc_acct.get_full_name(): [] for cc_acct in cc_accts.values()}
+    acct_trans = {cc_acct.get_full_name(): [] for cc_acct in acct_map.cc.values()}
     for split in splits:
         LOGGER.info("trying to match imbalance: %s", split_tuple(split))
         for other_split in split.parent.GetSplitList():
             acct_trans.get(other_split.GetAccount().get_full_name(), []).append(other_split)
 
     for _order_id, order in orders.items():
-        match_order(order, cc_accts, acct_trans, imbalance, tag_acct, gift_acct, expense_acct, )
+        match_order(order, acct_map, acct_trans, )
 
 
 def gnucash_import(filename, orders):
@@ -417,7 +439,9 @@ def gnucash_import(filename, orders):
         tag_acct = root.lookup_by_full_name('Expenses._Tag.Amazon')
         gift_acct = root.lookup_by_full_name('Expenses.Gifts')
         expense_acct = root.lookup_by_full_name('Expenses')
-        match_splits(imbalance, tag_acct, gift_acct, expense_acct, accts, orders)
+        acct_map = AccountMap(cc=accts, source=imbalance, tag=tag_acct,
+                              gift=gift_acct, expense=expense_acct, )
+        match_splits(acct_map, orders)
 
 def main():
     """Do everything"""
