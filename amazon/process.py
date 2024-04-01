@@ -7,11 +7,12 @@ import csv
 from dataclasses import dataclass, field
 import datetime
 from decimal import Decimal
+import itertools
 import logging
 import pprint
 import re
 
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, TypeVar
 
 import gnucash # type: ignore
 
@@ -55,14 +56,14 @@ class BalanceActivities:
     reload: Dict[str,BalanceActivity]
 
 
-@dataclass
+@dataclass(order=True)
 class LineItem:
     """Single Amazon purchase line item"""
     cost: Decimal
     date: datetime.datetime  # Use the closest available approximation to when charged
     desc: str
     is_gift: bool
-    data: dict      # Underlying CSV/JSON/etc. data for this line item
+    data: dict = field(repr=False)  # Underlying CSV/JSON/etc. data for this line item
 
     @classmethod
     def from_amazon_csv(cls, item):
@@ -302,8 +303,84 @@ class AccountMap:
 
 DEBUG_ORDER_ID: List[str] = []
 
-def match_order__find_payments(order, cc_accts, acct_trans):
-    """match_order: Find candidate payments"""
+def match_order__find_payment(order, amount, candidates, ):
+    """match_order: find a payment given a list of candidates"""
+    matched = []
+    for match_split in candidates:
+        match_amount = -1 * gnc_to_decimal(match_split.GetValue())
+        if order.order_id in DEBUG_ORDER_ID:
+            LOGGER.info('comparing %s?=%s to %s', amount, match_amount,
+                        split_tuple(match_split))
+        if (amount == match_amount and
+            near_date(order.date, match_split.parent.GetDate())):
+            # Splits match!
+            LOGGER.debug("matched transaction: %s=%s, %s to %s",
+                         amount, match_amount, order, split_tuple(match_split))
+            matched.append(match_split)
+    matched_split = None
+    if len(matched) == 0:
+        # boring
+        pass
+    elif len(matched) == 1:
+        # Yay
+        matched_split = matched[0]
+    else:
+        LOGGER.warning("multiple possible transactions: %s %s",
+                       order, [split_tuple(split) for split in matched])
+    return matched_split
+
+T1 = TypeVar('T1')
+def iter_subseq(lst: List[T1]) -> Iterable[Iterable[T1]]:
+    """Return all proper subsequences of `iterable`
+
+    We do not include the empty subsequence or the whole list. Results are
+    ordered by length, and for a given length lexicographic based on the input
+    iterable (using itertools.combinations internally).  """
+    subset_n_fn = lambda n: itertools.combinations(lst, n)
+    lengths = range(1, len(lst))
+    return itertools.chain.from_iterable(map(subset_n_fn, lengths))
+
+
+@dataclass
+class PaymentMatch:
+    """Return value elem from match_order__find_payments"""
+    amount: Decimal
+    anchor: gnucash.Split # existing split to anchor transaction
+    # - payment splits list, which should either
+    #   - parallel order.payments, with entries for splits that need to be
+    #     created left as None
+    #   - empty, indicating no new splits need be created
+    create: List[Optional[gnucash.Split]]
+    items: List[LineItem]
+
+def match_order__find_payments_part(order: Order,
+                                    candidates: List[gnucash.Split]) -> List[PaymentMatch]:
+    """Find payments that match a partition of the line items"""
+    subsets = iter_subseq(order.items)
+    matches: List[PaymentMatch] = []
+    for order_subset in subsets:
+        amount = Decimal(0) + sum(item.cost for item in order_subset)
+        matched_split = match_order__find_payment(order, amount, candidates)
+        if matched_split:
+            matches.append(PaymentMatch(amount, matched_split, [], list(order_subset)))
+
+    item_concat = list(itertools.chain.from_iterable(map((lambda part: part.items), matches)))
+    amount_sum = sum(part.amount for part in matches)
+    if (sorted(item_concat) == sorted(order.items) and
+        amount_sum == order.total):
+        return matches
+
+    if matches:
+        # Got at least some matches, so worth mentioning
+        LOGGER.warning("couldn't match order: %s %s", order, matches)
+
+    return []
+
+def match_order__find_payments(order, cc_accts, acct_trans) -> List[PaymentMatch]:
+    """match_order: Find candidate payments
+
+    Returns a list of PaymentMatch objects
+    """
     payment_splits: List[gnucash.Split] = []
     payment_split = None
     if order.order_id in DEBUG_ORDER_ID:
@@ -316,45 +393,64 @@ def match_order__find_payments(order, cc_accts, acct_trans):
             continue # next payment
         other_acct_name = other_acct.get_full_name()
         candidates = acct_trans[other_acct_name]
-        matched = []
-        for match_split in candidates:
-            match_amount = -1 * gnc_to_decimal(match_split.GetValue())
-            if order.order_id in DEBUG_ORDER_ID:
-                LOGGER.info('comparing %s?=%s to %s', amount, match_amount,
-                            split_tuple(match_split))
-            if (amount == match_amount and
-                near_date(order.date, match_split.parent.GetDate())):
-                # Splits match!
-                LOGGER.debug("matched transaction: %s=%s, %s to %s",
-                             amount, match_amount, order, split_tuple(match_split))
-                matched.append(match_split)
-        if len(matched) == 0:
-            # boring
-            payment_splits.append(None)
-        elif len(matched) == 1:
-            # Yay
-            payment_split = matched[0]
-            payment_splits.append(payment_split)
-        else:
-            LOGGER.warning("multiple possible transactions: %s %s",
-                           order, [split_tuple(split) for split in matched])
-            payment_splits.append(None)
 
-    for split in payment_splits:
-        # We should match at most one split
-        assert split == payment_split or split is None, \
-               (f'multiple payments: {order.payments=}, {split=}, '
-                f'{payment_splits=}, {payment_split=}')
+        matched_split = match_order__find_payment(order, amount, candidates)
+        if matched_split:
+            payment_split = matched_split
+        payment_splits.append(matched_split)
 
-    return payment_split, payment_splits
-
-
-def match_order__update_splits(order, payment_split, payment_splits, acct_map):
-    """Update GnuCash splits for matched order"""
-    remove_splits = []
     if payment_split:
+        # Yay we found a split that matches everything
+        for split in payment_splits:
+            # We should match at most one split
+            assert split == payment_split or split is None, \
+                   (f'multiple payments: {order.payments=}, {split=}, '
+                    f'{payment_splits=}, {payment_split=}')
+        return [PaymentMatch(order.total, payment_split, payment_splits, order.items)]
+
+    if len(order.items) < 2:
+        # With only one item, taking subsets won't help
+        return []
+
+    if len(order.payments) != 1:
+        # Multiple payments make things too complicated for now
+        # We could probably do something once we have an example
+        return []
+
+    # pylint:disable-next=undefined-loop-variable
+    if not (instrument and other_acct):
+        # We didn't find the account earlier, we're not going to find it now
+        return []
+
+    # These should all be valid still, but if we support multiple payments
+    # we'll need to do something
+    #other_acct = match_account(instrument, cc_accts)
+    #other_acct_name = other_acct.get_full_name()
+    #candidates = acct_trans[other_acct_name]
+
+    return match_order__find_payments_part(order, candidates)
+
+
+def match_order__update_splits(order, match, acct_map):
+    """Update GnuCash splits for matched order
+
+    We perform four operations:
+    - Remove unneeded splits from the existing transaction. The existing
+      transaction is identified based on `match.anchor`, which is the
+      anchoring split from the target account. Any splits on the transaction
+      associated with the `acct_map.source` account are deleted.
+    - Add a tag split to `acct_map.tag`
+    - Add payment splits -- `match.create` (if non-empty) should parallel
+      `order.payments` and have pre-existing splits that don't need to be
+      created. If `match.create` is empty, no new payments will be created.
+    - Add a purchase split for each line item
+
+    """
+
+    remove_splits = []
+    if match.anchor:
         # There's an existing split for payment
-        transaction = payment_split.parent
+        transaction = match.anchor.parent
         LOGGER.info("pre-update transaction: %s", trans_tuple(transaction))
         for split in transaction.GetSplitList():
             if split.GetAccount().get_full_name() == acct_map.source.get_full_name():
@@ -365,6 +461,10 @@ def match_order__update_splits(order, payment_split, payment_splits, acct_map):
         # moved away. In the first case we want to wait, the second basically
         # doesn't exist, and the third we don't want to act again. Either way,
         # ignore.
+        # For the CC case, note that we *do* check if there's a transaction
+        # from the gift card account to the source account, so manually
+        # adding such transactions and then running this script will create
+        # the splits appropriately.
         return
 
     book = acct_map.source.get_book()
@@ -376,8 +476,8 @@ def match_order__update_splits(order, payment_split, payment_splits, acct_map):
     set_split_amount(split, 0)
 
     # Add payment splits
-    for (instrument, amount), split in zip(order.payments, payment_splits):
-        if split == payment_split:
+    for (instrument, amount), split in zip(order.payments, match.create):
+        if split:
             # Already set up
             continue
         other_acct = match_account(instrument, acct_map.cc)
@@ -388,7 +488,7 @@ def match_order__update_splits(order, payment_split, payment_splits, acct_map):
         set_split_amount(split, -1*amount)
 
     # Add purchase splits
-    for item in order.items:
+    for item in match.items:
         split = gnucash.Split(book)
         split.SetParent(transaction)
         split.SetMemo(item.desc)
@@ -403,14 +503,24 @@ def match_order__update_splits(order, payment_split, payment_splits, acct_map):
 
 def match_order(order, acct_map: AccountMap, acct_trans, ):
     """Match a single Amazon order with GnuCash splits"""
-    payment_split, payment_splits = match_order__find_payments(order, acct_map.cc, acct_trans)
-    match_order__update_splits(order, payment_split, payment_splits, acct_map)
+    matches = match_order__find_payments(order, acct_map.cc, acct_trans)
+    for match in matches:
+        match_order__update_splits(order, match, acct_map)
 
 
 def match_splits(acct_map, orders):
     """Match Amazon orders with GnuCash splits"""
     # Pylint isn't wrong about this, but we'll fix it when refactoring match_order
     splits = acct_map.source.GetSplitList()
+
+    # Note: match_splits is quadratic: for each order we loop over each split
+    # associated with the right account. We know the amounts and a rough time
+    # window (and require that to be a unique key -- otherwise we don't match
+    # orders to splits), so if we had performance problems we could index based
+    # on that data. In practice, we expect perhaps a few dozen splits at a
+    # time, so don't bother with the complexity. Our concession to performance
+    # is the acct_trans map, so we're not looping over splits from *every*
+    # account.
 
     # Build a map of CC account to CC splits that need to be matched
     acct_trans = {cc_acct.get_full_name(): [] for cc_acct in acct_map.cc.values()}
