@@ -233,6 +233,7 @@ ACCT_NUM_REGEX = re.compile(r'(?P<num>\d{4})\D')
 
 IGNORED_CREDITCARD_ACCOUNTS = [
     '1008',     # Two AmEx accounts, fortunately little-used
+    '1003',     # Two AmEx accounts, ditto
 ]
 
 def get_creditcard_accounts(root: gnucash.Account) -> Dict[str,gnucash.Account]:
@@ -240,13 +241,14 @@ def get_creditcard_accounts(root: gnucash.Account) -> Dict[str,gnucash.Account]:
     accts = root.lookup_by_full_name('Credit Cards').get_descendants()
     acct_map = {}
     for acct in accts:
-        match = ACCT_NUM_REGEX.search(acct.GetName())
+        name = acct.GetName()
+        match = ACCT_NUM_REGEX.search(name)
         if match:
             num = match.group('num')
             if num in IGNORED_CREDITCARD_ACCOUNTS:
-                LOGGER.debug("Ignoring known-dup account number: %s", acct.GetName())
+                LOGGER.debug("Ignoring known-dup account number: %s", name)
                 continue
-            assert num not in acct_map
+            assert num not in acct_map, f"duplicate account {name}"
             acct_map[match.group('num')] = acct #AccountInfo(acct, [])
         else:
             LOGGER.debug("Unknown last-4 for account: %s", acct.GetName())
