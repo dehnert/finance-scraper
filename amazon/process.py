@@ -91,7 +91,7 @@ class LineItem:
         date = datetime.datetime.fromisoformat(item['Ship Date'].split(' and ')[0].replace('Z', ''))
 
         desc = item['Product Name']
-        is_gift = (item['Gift Message'] != 'Not Available')
+        is_gift = (item['Gift Message'] != 'Not Available') # pylint:disable=superfluous-parens
         return cls(cost=cost, date=date, desc=desc, is_gift=is_gift, data=item)
 
 @dataclass
@@ -127,8 +127,9 @@ class Order:
             gift_amount = 0
         balance = self.total
         self.payments = []
-        key = lambda x: (((x == 'Gift Certificate/Card') ^ (gift_amount > 0)), x)
-        for instrument in sorted(payments, key=key):
+        def sort_key(acct):
+            return (((acct == 'Gift Certificate/Card') ^ (gift_amount > 0)), acct)
+        for instrument in sorted(payments, key=sort_key):
             if 'Gift Certificate/Card' == instrument and gift_amount > 0:
                 amount = gift_amount
             else:
@@ -329,14 +330,15 @@ def match_order__find_payment(order, amount, candidates, ):
                        order, [split_tuple(split) for split in matched])
     return matched_split
 
-T1 = TypeVar('T1')
-def iter_subseq(lst: List[T1]) -> Iterable[Iterable[T1]]:
+Elem = TypeVar('Elem')
+def iter_subseq(lst: List[Elem]) -> Iterable[Iterable[Elem]]:
     """Return all proper subsequences of `iterable`
 
     We do not include the empty subsequence or the whole list. Results are
     ordered by length, and for a given length lexicographic based on the input
     iterable (using itertools.combinations internally).  """
-    subset_n_fn = lambda n: itertools.combinations(lst, n)
+    def subset_n_fn(n):
+        return itertools.combinations(lst, n)
     lengths = range(1, len(lst))
     return itertools.chain.from_iterable(map(subset_n_fn, lengths))
 
