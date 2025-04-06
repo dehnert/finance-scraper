@@ -138,10 +138,11 @@ class Order:
             balance -= amount
         assert balance == 0, f"{self.payments=} {balance_payment=}"
 
-AMAZON_BALANCE_PAYMENT  = re.compile(r"Payment towards Amazon.com order \(‎?(?P<num>[0-9-]*)\)")
-AMAZON_BALANCE_GC_CLAIM = re.compile(r"Gift card claim \(claim code xxxx-xxxxxx-(?P<code>[A-Z0-9]{4})\)") # pylint:disable=line-too-long
-AMAZON_BALANCE_RELOAD   = re.compile(r"Balance Reload \(‎?(?P<num>[0-9-]*)\)")
-
+AMAZON_BALANCE_PAYMENT  = re.compile(r"Gift Card applied to Amazon.com order ‎?(?P<num>[0-9-]*)")
+AMAZON_BALANCE_GC_CLAIM = re.compile(r"Gift Card added Claim code: xxxx-xxxxxx-(?P<code>[A-Z0-9]{4})\)") # pylint:disable=line-too-long
+AMAZON_BALANCE_RELOAD   = re.compile(r"Gift Card Balance added from Reload ‎?(?P<num>[0-9-]*)")
+AMAZON_BALANCE_REFUND   = re.compile(r"Refund from Amazon.com order")
+AMAZON_BALANCE_UNHOLD   = re.compile(r"Release of Gift Card Balance hold from Amazon.com order ‎?(?P<num>[0-9-]*)")
 
 def load_amazon_balance(bal_fp) -> BalanceActivities:
     """Return Amazon gift card balances by parsing CSV file"""
@@ -164,9 +165,17 @@ def load_amazon_balance(bal_fp) -> BalanceActivities:
         if match:
             event = 'reload'
             arg = match.group('num')
+        match = AMAZON_BALANCE_REFUND.match(desc)
+        if match:
+            event = 'refund'
+            arg = ''
+        match = AMAZON_BALANCE_UNHOLD.match(desc)
+        if match:
+            event = 'refund'
+            arg = match.group('num')
         assert event, f'unknown balance activity: {desc}'
         event_date = datetime.datetime.strptime(line['Date '].strip(), '%B %d, %Y').date()
-        amount = comma_decimal(line['Amount'].replace('$', ''))
+        amount = comma_decimal(line['Amount '].replace('$', ''))
         activity = BalanceActivity(event_date, desc, event, arg, amount)
         activities.append(activity)
         if event == 'payment':
