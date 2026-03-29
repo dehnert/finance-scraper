@@ -1,0 +1,31 @@
+To bulk download statements, on a statement page, something like this worked for a couple and then logged me out:
+
+downloads = document.querySelectorAll('button[title="Download"]'); for (download of downloads) { console.log(download); await sleep(100); await download.click(); await sleep(100); await document.getElementById('myca-activity-download-footer-download-confirm-statement_pdf-Download-anchor').click(); await sleep(1000); }
+
+This seemed to work:
+downloads = document.querySelectorAll('button[title="Download"]'); for (download of downloads) { console.log(download); await sleep(1000); await download.click(); await sleep(1000); await document.getElementById('myca-activity-download-footer-download-confirm-statement_pdf-Download-anchor').click(); await sleep(10000); }
+
+(Dunno if there's a rate limit involved.)
+
+I just walked away and it churned through opening new tabs with downloaded statements. The process was somewhat slow; next time probably try a 1 second wait between statements? (Reducing the whole loop time to 3 seconds from 12.)
+
+Next up:
+downloads = document.querySelectorAll('button[title="Download"]'); for (download of downloads) { console.log(download); await sleep(100); await download.click(); await sleep(400); await document.getElementById('myca-activity-download-footer-download-confirm-statement_pdf-Download-anchor').click(); await sleep(1000); }
+
+It felt like it was waiting longer when the tab was out of focus. Basically I clicked on the statement list tab, and every time it felt like it instantly started downloading another statement. Going through about a dozen statements did feel *very* fast.
+
+
+
+Sleep is from StackOverflow:
+function sleep (time) {
+  return new Promise((resolve) => setTimeout(resolve, time));
+}
+
+
+The year end summary download confirm dialog needs a different ID:
+document.getElementById('myca-activity-download-footer-download-confirm-yes_pdf-Download-anchor').click()
+
+I just manually download it; automating it doesn't seem worth it since there's only one available at a time.
+
+This whole process results in a bunch of files in the default download location. I sort them by year with:
+for year in `seq 2012 2026`; do echo; echo $year; mv -iv ~/Downloads/$year-??-??.pdf ../$year/amex/blue-cash/; done
